@@ -100,9 +100,9 @@ Now analyze these tickets:
 
 
 # --------------------------------------------------------
-# UTIL: READ INPUT TEXT FILE
+# READ INPUT TEXT FILE
 # --------------------------------------------------------
-def read_text(path: str) -> str:
+def read_text(path):
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
 
@@ -114,7 +114,7 @@ def read_text(path: str) -> str:
 # followed by
 #   next line starting with [G7APP-xxxxx]
 # --------------------------------------------------------
-def extract_tickets(text: str):
+def extract_tickets(text):
     pattern = r"(?m)^.*Jira.*\n\[G7APP-\d+\]"
     matches = list(re.finditer(pattern, text))
 
@@ -133,7 +133,7 @@ def extract_tickets(text: str):
 def chunk_tickets(tickets):
     chunks = []
     for i in range(0, len(tickets), TICKETS_PER_CHUNK):
-        joined = "\n\n---\n\n".join(tickets[i : i + TICKETS_PER_CHUNK])
+        joined = "\n\n---\n\n".join(tickets[i: i + TICKETS_PER_CHUNK])
         chunks.append(joined)
     return chunks
 
@@ -141,7 +141,10 @@ def chunk_tickets(tickets):
 # --------------------------------------------------------
 # CALL GEMINI
 # --------------------------------------------------------
-def call_gemini(chunk_text: str) -> str | None:
+def call_gemini(chunk_text):
+    if not chunk_text:
+        return None
+
     payload = {
         "contents": [
             {"parts": [{"text": PROMPT_TEMPLATE + "\n" + chunk_text}]}
@@ -174,7 +177,7 @@ def call_gemini(chunk_text: str) -> str | None:
 # --------------------------------------------------------
 # EXTRACT JSON BETWEEN <JSON> ... </JSON>
 # --------------------------------------------------------
-def extract_json(raw_text: str | None):
+def extract_json(raw_text):
     if raw_text is None:
         return None
 
@@ -186,11 +189,10 @@ def extract_json(raw_text: str | None):
         print("❌ Missing <JSON> tags in Gemini response.")
         return None
 
-    json_block = raw[start + len("<JSON>") : end].strip()
+    json_block = raw[start + len("<JSON>"): end].strip()
 
     try:
         data = json.loads(json_block)
-        # Ensure it's a list
         if isinstance(data, dict):
             data = [data]
         return data
@@ -219,7 +221,7 @@ def list_to_html(items):
 # --------------------------------------------------------
 # GENERATE MODERN CARD-STYLE HTML FROM JSONL
 # --------------------------------------------------------
-def generate_html(jsonl_path: str, output_path: str):
+def generate_html(jsonl_path, output_path):
     html = """
 <html>
 <head>
@@ -320,7 +322,6 @@ def generate_html(jsonl_path: str, output_path: str):
 <div class="grid">
 """
 
-    # Read all JSONL entries and build cards
     with open(jsonl_path, "r", encoding="utf-8") as f:
         for line in f:
             if not line.strip():
@@ -340,7 +341,6 @@ def generate_html(jsonl_path: str, output_path: str):
                 missing = obj.get("missing_details", [])
                 link = obj.get("link") or (JIRA_DOMAIN + ticket_key if ticket_key else "#")
 
-                # Badge color
                 if category == "Solvable Bug":
                     badge_class = "green"
                 elif category == "Needs More Details":
