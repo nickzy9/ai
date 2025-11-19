@@ -4,22 +4,24 @@ import re
 import requests
 import json
 
-# -------------------------------------
-# CONFIGURATION
-# -------------------------------------
+# ----------------------------
+# CONFIG
+# ----------------------------
 API_KEY = "YOUR_GEMINI_API_KEY"
 MODEL = "gemini-2.0-pro"
-GENERATION_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={API_KEY}"
+GENERATION_URL = (
+    f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={API_KEY}"
+)
 
-MAX_TICKETS_PER_CHUNK = 5  # safe chunk size (adjust later)
+MAX_TICKETS_PER_CHUNK = 5  # Safe number to avoid context issues
 
 PROMPT_TEMPLATE = """
 You are an expert QA analyst, senior iOS engineer, and Jira triage specialist.
 
 Process the following Jira tickets and output ONLY <tr> rows for an HTML table.
-DO NOT include <html>, <body>, or <table> tags.
+DO NOT include <html>, <body>, <table> or <head> tags.
 
-Extract for each ticket:
+Extract:
 - Ticket Key
 - Status
 - Category (Solvable Bug / Not a Bug / Needs More Details)
@@ -29,7 +31,7 @@ Extract for each ticket:
 - Missing Details
 - Ticket Link
 
-Output format (one <tr> per ticket):
+Output one <tr> per ticket:
 
 <tr>
   <td>TicketKey</td>
@@ -45,14 +47,14 @@ Output format (one <tr> per ticket):
 Now analyze this chunk:
 """
 
-HTML_TEMPLATE = """
+HTML_HEADER = """
 <html>
 <head>
 <title>Jira Bug Analysis</title>
 <style>
-table { border-collapse: collapse; width: 100%; }
-td, th { border: 1px solid #ccc; padding: 8px; vertical-align: top; }
-tr:nth-child(even) { background: #f7f7f7; }
+table {{ border-collapse: collapse; width: 100%; }}
+td, th {{ border: 1px solid #ccc; padding: 8px; vertical-align: top; }}
+tr:nth-child(even) {{ background: #f7f7f7; }}
 </style>
 </head>
 <body>
@@ -68,7 +70,9 @@ tr:nth-child(even) { background: #f7f7f7; }
   <th>Missing Details</th>
   <th>Link</th>
 </tr>
-{rows}
+"""
+
+HTML_FOOTER = """
 </table>
 </body>
 </html>
@@ -84,27 +88,23 @@ def read_text(text_file):
 
 
 # ----------------------------
-# Extract tickets using regex
+# Extract tickets (safe boundaries)
 # ----------------------------
 def extract_tickets(text):
-    # Jira ticket keys: ABC-123, DEF-9999, etc.
-    pattern = r"([A-Z]{2,10}-\d+)"
-
+    pattern = r"([A-Z]{2,12}-\d+)"  # Jira ID format: ABC-1234
     matches = list(re.finditer(pattern, text))
     tickets = []
 
     for i in range(len(matches)):
         start = matches[i].start()
-        end = matches[i+1].start() if i+1 < len(matches) else len(text)
-
-        ticket_text = text[start:end].strip()
-        tickets.append(ticket_text)
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        tickets.append(text[start:end].strip())
 
     return tickets
 
 
 # ----------------------------
-# Chunk tickets safely
+# Chunk tickets (not lines)
 # ----------------------------
 def chunk_tickets(tickets):
     chunks = []
@@ -115,7 +115,7 @@ def chunk_tickets(tickets):
 
 
 # ----------------------------
-# Call Gemini API
+# Gemini API call
 # ----------------------------
 def call_gemini(chunk):
     payload = {
@@ -124,24 +124,24 @@ def call_gemini(chunk):
         ]
     }
 
-    response = requests.post(
+    resp = requests.post(
         GENERATION_URL,
         headers={"Content-Type": "application/json"},
-        data=json.dumps(payload),
+        data=json.dumps(payload)
     )
 
-    if response.status_code != 200:
-        print("❌ API Error:", response.text)
+    if resp.status_code != 200:
+        print("❌ API Error:", resp.text)
         return ""
 
     try:
-        return response.json()["candidates"][0]["content"]["parts"][0]["text"]
+        return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
     except:
         return ""
 
 
 # ----------------------------
-# Extract <tr> rows from output
+# Extract HTML rows
 # ----------------------------
 def extract_rows(text):
     rows = []
@@ -152,42 +152,59 @@ def extract_rows(text):
 
 
 # ----------------------------
-# Main
+# Main Logic (streaming safe)
 # ----------------------------
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python jira_text_analyzer.py jira_dump.txt")
+        print("Usage: python jira_text_analyzer_streaming.py jira_dump.txt")
         return
 
-    text_file = sys.argv[1]
+    input_file = sys.argv[1]
 
-    print("📄 Reading text file...")
-    raw_text = read_text(text_file)
+    raw_text = read_text(input_file)
 
-    print("🔍 Detecting tickets...")
     tickets = extract_tickets(raw_text)
-    print(f"📦 Total tickets found: {len(tickets)}")
+    print(f"📦 Tickets found: {len(tickets)}")
 
-    print("✂️ Creating chunks...")
     chunks = chunk_tickets(tickets)
-    print(f"📦 Total chunks: {len(chunks)}")
+    print(f"📦 Processing chunks: {len(chunks)}")
 
-    all_rows = []
+    # ---- STREAMED OUTPUT FILES ----
+    json_file = open("jira_results.jsonl", "w", encoding="utf-8")
+    html_file = open("jira_report.html", "w", encoding="utf-8")
 
+    # Write HTML header once
+    html_file.write(HTML_HEADER)
+
+    # Process each chunk
     for idx, chunk in enumerate(chunks):
-        print(f"\n🚀 Processing chunk {idx+1}/{len(chunks)}...")
+        print(f"\n🚀 Processing chunk {idx + 1}/{len(chunks)}...")
+
         output = call_gemini(chunk)
         rows = extract_rows(output)
+
         print(f"→ Extracted rows: {len(rows)}")
-        all_rows.extend(rows)
 
-    print("\n🧩 Building final HTML...")
-    final_html = HTML_TEMPLATE.format(rows="\n".join(all_rows))
+        # Write JSON safely line-by-line
+        json_file.write(json.dumps({
+            "chunk_index": idx,
+            "raw_output": output,
+            "rows": rows
+        }) + "\n")
 
-    with open("jira_report.html", "w", encoding="utf-8") as f:
-        f.write(final_html)
+        # Append rows to HTML file
+        for row in rows:
+            html_file.write(row + "\n")
 
-    print("✅ Done! Saved as jira_report.html")
+    # Close HTML on completion
+    html_file.write(HTML_FOOTER)
+
+    json_file.close()
+    html_file.close()
+
+    print("\n✅ Done!")
+    print("📁 JSON saved → jira_results.jsonl")
+    print("📁 HTML saved → jira_report.html")
 
 
 if __name__ == "__main__":
