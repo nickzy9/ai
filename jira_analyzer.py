@@ -4,71 +4,86 @@ import re
 import requests
 import json
 
-# ----------------------------
-# CONFIG
-# ----------------------------
+# --------------------------------------------------------
+# CONFIGURATION
+# --------------------------------------------------------
 API_KEY = "YOUR_GEMINI_API_KEY"
 MODEL = "gemini-2.0-pro"
+JIRA_DOMAIN = "https://your-jira-domain/browse/"
 
 GENERATION_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={API_KEY}"
+    f"https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{MODEL}:generateContent?key={API_KEY}"
 )
 
 TICKETS_PER_CHUNK = 3
 TIMEOUT = 60
 
-# JSON-only Gemini prompt
+
+# --------------------------------------------------------
+# GEMINI PROMPT: JSON-ONLY WITH TAGS
+# --------------------------------------------------------
 PROMPT_TEMPLATE = """
 You are an expert QA analyst and senior iOS engineer.
 
-I will give you one or more Jira tickets.
+You MUST output valid JSON ONLY.
 
-For each ticket, return JSON ONLY.
-No HTML. No markdown. No commentary.
+Wrap your JSON output inside the following tags:
 
-Output must be STRICTLY valid JSON array:
-[
-  {
-    "ticket_key": "",
-    "status": "",
-    "category": "",
-    "summary": "",
-    "reasoning": "",
-    "fix": "",
-    "missing_details": "",
-    "link": ""
-  }
-]
+<JSON>
+[ {...}, {...} ]
+</JSON>
 
-"category" must be one of:
+Rules:
+- No text before <JSON>
+- No text after </JSON>
+- Inside <JSON> must be valid JSON array
+- No markdown
+- No commentary
+- Respond with an array of objects: one per ticket.
+
+Each JSON object must look like:
+
+{
+  "ticket_key": "",
+  "status": "",
+  "category": "",
+  "summary": "",
+  "reasoning": "",
+  "fix": "",
+  "missing_details": "",
+  "link": ""
+}
+
+If link is missing, construct:
+"https://your-jira-domain/browse/<ticket_key>"
+
+Allowed values for "category":
 - "Solvable Bug"
 - "Not a Bug"
 - "Needs More Details"
 
-Construct "link" as:
-"https://your-jira-domain/browse/<ticket_key>"
-if the link is missing.
-
 Now analyze these tickets:
 """
 
-# ----------------------------
-# Read Text
-# ----------------------------
+
+# --------------------------------------------------------
+# READ INPUT TEXT FILE
+# --------------------------------------------------------
 def read_text(path):
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
 
-# ----------------------------
-# Detect Tickets (New Regex)
-# ----------------------------
+
+# --------------------------------------------------------
+# EXTRACT TICKETS USING NEW RULE:
+# Line contains 'Jira' + next line starts with [G7APP-xxxxx]
+# --------------------------------------------------------
 def extract_tickets(text):
-    # Ticket begins where a line contains "Jira"
-    # followed by next line starting with [G7APP-xxxxx]
     pattern = r"(?m)^.*Jira.*\n\[G7APP-\d+\]"
     matches = list(re.finditer(pattern, text))
-    tickets = []
 
+    tickets = []
     for i in range(len(matches)):
         start = matches[i].start()
         end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
@@ -77,18 +92,21 @@ def extract_tickets(text):
 
     return tickets
 
-# ----------------------------
-# Chunk Tickets
-# ----------------------------
+
+# --------------------------------------------------------
+# CHUNK TICKETS
+# --------------------------------------------------------
 def chunk_tickets(tickets):
     chunks = []
     for i in range(0, len(tickets), TICKETS_PER_CHUNK):
-        chunks.append("\n\n---\n\n".join(tickets[i:i + TICKETS_PER_CHUNK]))
+        joined = "\n\n---\n\n".join(tickets[i:i + TICKETS_PER_CHUNK])
+        chunks.append(joined)
     return chunks
 
-# ----------------------------
-# Call Gemini (JSON response)
-# ----------------------------
+
+# --------------------------------------------------------
+# CALL GEMINI (returns raw text)
+# --------------------------------------------------------
 def call_gemini(chunk):
     payload = {
         "contents": [
@@ -104,7 +122,7 @@ def call_gemini(chunk):
             timeout=TIMEOUT
         )
     except Exception as e:
-        print("❌ Request error:", e)
+        print("❌ Network error:", e)
         return None
 
     if response.status_code != 200:
@@ -112,17 +130,41 @@ def call_gemini(chunk):
         return None
 
     try:
-        text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
-        return json.loads(text)   # Gemini must return valid JSON
-    except Exception as e:
-        print("⚠️ JSON parse error:", e)
-        print("Raw output:", response.text[:500])
+        return response.json()["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception:
         return None
 
-# ----------------------------
-# Generate HTML from JSON
-# ----------------------------
-def generate_html(jsonl_path, output_html):
+
+# --------------------------------------------------------
+# SAFE JSON EXTRACTION: extract JSON between <JSON> tags
+# --------------------------------------------------------
+def extract_json(raw_text):
+    if raw_text is None:
+        return None
+
+    raw = raw_text.strip()
+
+    start = raw.find("<JSON>")
+    end = raw.find("</JSON>")
+
+    if start == -1 or end == -1:
+        print("❌ No <JSON> tags found.")
+        return None
+
+    json_block = raw[start + len("<JSON>") : end].strip()
+
+    try:
+        return json.loads(json_block)
+    except json.JSONDecodeError as e:
+        print("❌ JSON decode error:", e)
+        print("⚠️ Raw JSON block failed:", json_block[:200])
+        return None
+
+
+# --------------------------------------------------------
+# GENERATE HTML FROM JSONL
+# --------------------------------------------------------
+def generate_html(jsonl_path, output_path):
     html = """
 <html>
 <head>
@@ -154,14 +196,14 @@ tr:nth-child(even) { background: #f7f7f7; }
             for obj in data["results"]:
                 html += f"""
 <tr>
-  <td>{obj['ticket_key']}</td>
-  <td>{obj['status']}</td>
-  <td>{obj['category']}</td>
-  <td>{obj['summary']}</td>
-  <td>{obj['reasoning']}</td>
-  <td>{obj['fix']}</td>
-  <td>{obj['missing_details']}</td>
-  <td><a href="{obj['link']}">Open</a></td>
+  <td>{obj.get('ticket_key','')}</td>
+  <td>{obj.get('status','')}</td>
+  <td>{obj.get('category','')}</td>
+  <td>{obj.get('summary','')}</td>
+  <td>{obj.get('reasoning','')}</td>
+  <td>{obj.get('fix','')}</td>
+  <td>{obj.get('missing_details','')}</td>
+  <td><a href="{obj.get('link','')}">Open</a></td>
 </tr>
 """
 
@@ -171,45 +213,49 @@ tr:nth-child(even) { background: #f7f7f7; }
 </html>
 """
 
-    with open(output_html, "w", encoding="utf-8") as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         f.write(html)
 
-    print(f"📁 HTML report saved: {output_html}")
+    print(f"📁 HTML report saved → {output_path}")
 
-# ----------------------------
-# MAIN
-# ----------------------------
+
+# --------------------------------------------------------
+# MAIN EXECUTION
+# --------------------------------------------------------
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python jira_g7app_json_analyzer.py jira_dump.txt")
+        print("Usage: python jira_g7app_analyzer.py jira_dump.txt")
         return
 
-    input_file = sys.argv[1]
+    text_path = sys.argv[1]
+    raw_text = read_text(text_path)
 
-    print("📄 Loading text...")
-    raw_text = read_text(input_file)
-
-    print("🔍 Extracting ticket boundaries...")
+    print("🔍 Extracting ticket blocks...")
     tickets = extract_tickets(raw_text)
-    print(f"📦 Tickets found: {len(tickets)}")
+    print(f"📦 Total tickets found: {len(tickets)}")
 
     chunks = chunk_tickets(tickets)
-    print(f"✂️ Chunks: {len(chunks)}")
+    print(f"✂️ Chunk count: {len(chunks)}")
 
     jsonl_path = "jira_results.jsonl"
-    jsonl = open(jsonl_path, "w", encoding="utf-8")
+    jsonl_file = open(jsonl_path, "w", encoding="utf-8")
 
     for idx, chunk in enumerate(chunks):
         print(f"\n🚀 Processing chunk {idx + 1}/{len(chunks)}")
 
-        results = call_gemini(chunk)
-        if results is None:
-            print("⚠️ Skipping chunk.")
+        raw = call_gemini(chunk)
+        json_data = extract_json(raw)
+
+        if json_data is None:
+            print("⚠️ Skipping chunk due to JSON error.")
             continue
 
-        jsonl.write(json.dumps({ "chunk": idx, "results": results }) + "\n")
+        jsonl_file.write(json.dumps({
+            "chunk": idx,
+            "results": json_data
+        }) + "\n")
 
-    jsonl.close()
+    jsonl_file.close()
     print("📁 JSONL saved:", jsonl_path)
 
     print("\n🧱 Generating HTML...")
