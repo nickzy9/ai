@@ -7,9 +7,9 @@ import json
 # --------------------------------------------------------
 # CONFIGURATION
 # --------------------------------------------------------
-API_KEY = "YOUR_GEMINI_API_KEY"
+API_KEY = "YOUR_GEMINI_API_KEY_HERE"
 MODEL = "gemini-2.0-pro"
-JIRA_DOMAIN = "https://your-jira-domain/browse/"
+JIRA_DOMAIN = "https://your-jira-domain/browse/"  # e.g. "https://jira.yourcompany.com/browse/"
 
 GENERATION_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -21,66 +21,100 @@ TIMEOUT = 60
 
 
 # --------------------------------------------------------
-# GEMINI PROMPT (JSON ONLY WITH TAG WRAPPER)
+# GEMINI PROMPT (MAX DETAIL, DEV-GRADE FIXES)
 # --------------------------------------------------------
 PROMPT_TEMPLATE = """
-You are an expert QA analyst and senior iOS engineer.
+You are a principal-level iOS engineer and QA triage lead working on a complex medical / telemetry app
+(similar to Dexcom G7), with architecture including:
 
-You MUST output valid JSON ONLY.
+- iOS app (Swift / SwiftUI, MVVM, coordinators)
+- AppCore / SDK layers for business logic
+- Bluetooth / GATT / sensor communication
+- Notification & alert pipeline (local + push)
+- Data logging / bulk logging flows
+- Watch / companion app flows
+- Error handling, queues, and state machines
 
-Wrap your JSON output inside the following tags:
+You will receive one or more Jira tickets in plain text. For EACH ticket you must:
+
+1) Understand the bug deeply.
+2) Decide if it is:
+   - "Solvable Bug"
+   - "Not a Bug"
+   - "Needs More Details"
+3) Provide detailed, senior-engineer-level analysis and fix guidance.
+
+You MUST output valid JSON ONLY, wrapped like this:
 
 <JSON>
 [ {...}, {...} ]
 </JSON>
 
-Rules:
-- No text before <JSON>
-- No text after </JSON>
-- Inside <JSON> must be valid JSON array
-- No markdown
-- No commentary
-- No explanation outside JSON
-- One JSON object per ticket
+NO text before <JSON>.
+NO text after </JSON>.
+Inside <JSON> must be a valid JSON ARRAY.
 
-Each JSON object must contain:
+Each ticket must be represented as ONE JSON object with this exact shape:
 
 {
   "ticket_key": "",
   "status": "",
-  "category": "",
-  "summary": "",
-  "reasoning": "",
-  "fix": "",
-  "missing_details": "",
-  "link": ""
+  "category": "",   // "Solvable Bug", "Not a Bug", or "Needs More Details"
+  "summary": "",    // 1–2 sentence summary of the issue
+  "root_cause": [   // bullet-style reasoning of the likely root cause
+    "..."
+  ],
+  "reasoning": [    // why you classified it that way (triage reasoning)
+    "..."
+  ],
+  "fix_recommendation": [   // concrete, developer-grade action items
+    "..."
+  ],
+  "risk": [         // possible regressions or risk areas
+    "..."
+  ],
+  "missing_details": [      // only if category is 'Needs More Details' OR if something is unclear
+    "..."
+  ],
+  "link": ""        // Jira link; if missing, construct with the ticket key
 }
 
-If "link" is missing, create:
-"https://your-jira-domain/browse/<ticket_key>"
+Rules and expectations:
 
-Allowed values for "category":
-- "Solvable Bug"
-- "Not a Bug"
-- "Needs More Details"
+- Think like a senior dev reviewing Jira for implementation.
+- "root_cause" is technical: e.g. wrong state machine transition, stale cache, race between alert clear and schedule, missing guard for nil, etc.
+- "fix_recommendation" must be actionable and specific. Wherever possible mention:
+    - which layer (e.g. AppCore, SDK, view model, notification scheduler, logging service)
+    - what condition or branch to adjust
+    - whether to add guards / debouncing / queueing
+    - whether to add or update unit tests and integration tests
+- "risk" should mention possible side-effects and areas to regression-test (e.g. other flows using same service, related alerts, watch flows, bulk logging behavior).
+- "missing_details" should list EXACT things needed: logs, screenshots, reproduction steps, build number, OS version, watch/phone pairing state, etc.
+- If you believe something is "Not a Bug", clearly explain in "reasoning" why the behavior is expected or spec-compliant.
+- If you select "Needs More Details", still try to infer as much as possible from the ticket, but list clearly what is blocking you.
+- Always return an ARRAY: [ { ... }, { ... } ] even if there is only 1 ticket in the chunk.
+- Do NOT use markdown. Do NOT add any prose outside the JSON.
 
 Now analyze these tickets:
 """
 
 
 # --------------------------------------------------------
-# READ INPUT TEXT FILE
+# UTIL: READ INPUT TEXT FILE
 # --------------------------------------------------------
-def read_text(path):
+def read_text(path: str) -> str:
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
 
 
 # --------------------------------------------------------
-# EXTRACT TICKETS (correct boundary rule)
-# Line containing "Jira" + next line starting with [G7APP-xxxxx]
+# EXTRACT TICKETS
+# Ticket begins at:
+#   any line containing "Jira"
+# followed by
+#   next line starting with [G7APP-xxxxx]
 # --------------------------------------------------------
-def extract_tickets(text):
+def extract_tickets(text: str):
     pattern = r"(?m)^.*Jira.*\n\[G7APP-\d+\]"
     matches = list(re.finditer(pattern, text))
 
@@ -94,22 +128,23 @@ def extract_tickets(text):
 
 
 # --------------------------------------------------------
-# CHUNK TICKETS
+# CHUNK TICKETS (3 per chunk)
 # --------------------------------------------------------
 def chunk_tickets(tickets):
     chunks = []
     for i in range(0, len(tickets), TICKETS_PER_CHUNK):
-        chunks.append("\n\n---\n\n".join(tickets[i:i + TICKETS_PER_CHUNK]))
+        joined = "\n\n---\n\n".join(tickets[i : i + TICKETS_PER_CHUNK])
+        chunks.append(joined)
     return chunks
 
 
 # --------------------------------------------------------
 # CALL GEMINI
 # --------------------------------------------------------
-def call_gemini(chunk):
+def call_gemini(chunk_text: str) -> str | None:
     payload = {
         "contents": [
-            {"parts": [{"text": PROMPT_TEMPLATE + "\n" + chunk}]}
+            {"parts": [{"text": PROMPT_TEMPLATE + "\n" + chunk_text}]}
         ]
     }
 
@@ -118,7 +153,7 @@ def call_gemini(chunk):
             GENERATION_URL,
             headers={"Content-Type": "application/json"},
             data=json.dumps(payload),
-            timeout=TIMEOUT
+            timeout=TIMEOUT,
         )
     except Exception as e:
         print("❌ Network error:", e)
@@ -129,16 +164,17 @@ def call_gemini(chunk):
         return None
 
     try:
-        return response.json()["candidates"][0]["content"]["parts"][0]["text"]
+        text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
+        return text
     except Exception:
+        print("❌ Unexpected response shape from Gemini.")
         return None
 
 
 # --------------------------------------------------------
-# SAFE JSON EXTRACTION
-# Only parse content between <JSON> ... </JSON>
+# EXTRACT JSON BETWEEN <JSON> ... </JSON>
 # --------------------------------------------------------
-def extract_json(raw_text):
+def extract_json(raw_text: str | None):
     if raw_text is None:
         return None
 
@@ -147,23 +183,43 @@ def extract_json(raw_text):
     end = raw.find("</JSON>")
 
     if start == -1 or end == -1:
-        print("❌ Missing <JSON> tags.")
+        print("❌ Missing <JSON> tags in Gemini response.")
         return None
 
     json_block = raw[start + len("<JSON>") : end].strip()
 
     try:
-        return json.loads(json_block)
+        data = json.loads(json_block)
+        # Ensure it's a list
+        if isinstance(data, dict):
+            data = [data]
+        return data
     except Exception as e:
         print("❌ JSON decode error:", e)
-        print("⚠️ Raw JSON block failed:", json_block[:500])
+        print("⚠️ Raw JSON block that failed:\n", json_block[:500])
         return None
 
 
 # --------------------------------------------------------
-# GENERATE BEAUTIFUL HTML FROM JSONL
+# HELPER: ARRAY -> <li> LIST HTML
 # --------------------------------------------------------
-def generate_html(jsonl_path, output_path):
+def list_to_html(items):
+    if not items:
+        return "<li>-</li>"
+    safe_items = []
+    for it in items:
+        if it is None:
+            continue
+        safe_items.append(str(it))
+    if not safe_items:
+        return "<li>-</li>"
+    return "".join(f"<li>{entry}</li>" for entry in safe_items)
+
+
+# --------------------------------------------------------
+# GENERATE MODERN CARD-STYLE HTML FROM JSONL
+# --------------------------------------------------------
+def generate_html(jsonl_path: str, output_path: str):
     html = """
 <html>
 <head>
@@ -172,68 +228,85 @@ def generate_html(jsonl_path, output_path):
     body {
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial;
         margin: 0;
-        padding: 20px;
-        background: #f5f7fa;
+        padding: 30px;
+        background: #f0f2f5;
         color: #333;
     }
     h1 {
-        font-size: 28px;
-        font-weight: 600;
+        font-size: 32px;
         text-align: center;
-        margin-bottom: 25px;
+        margin-bottom: 30px;
         color: #222;
     }
-    table {
-        width: 100%;
-        border-collapse: separate;
-        border-spacing: 0 10px;
+    .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(420px, 1fr));
+        gap: 20px;
     }
-    thead tr {
+    .card {
         background: #fff;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.08);
+        border-radius: 14px;
+        padding: 20px;
+        box-shadow: 0 4px 10px rgba(0,0,0,0.08);
+        transition: transform 0.15s ease, box-shadow 0.15s ease;
     }
-    th {
-        padding: 14px;
-        font-size: 14px;
-        text-transform: uppercase;
-        color: #555;
-        border-bottom: 1px solid #eee;
-        text-align: left;
-        position: sticky;
-        top: 0;
-        background: #fff;
-        z-index: 10;
+    .card:hover {
+        transform: translateY(-4px);
+        box-shadow: 0 6px 20px rgba(0,0,0,0.12);
     }
-    tr.data-row {
-        background: #fff;
-        transition: all 0.15s ease-in-out;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.06);
+    .ticket-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 10px;
     }
-    tr.data-row:hover {
-        transform: scale(1.01);
-        box-shadow: 0 4px 8px rgba(0,0,0,0.10);
-    }
-    td {
-        padding: 14px;
-        font-size: 14px;
-        vertical-align: top;
-        border-bottom: 1px solid #eee;
+    .ticket-key {
+        font-size: 18px;
+        font-weight: 700;
+        color: #2c3e50;
     }
     .badge {
-        padding: 6px 12px;
+        padding: 6px 14px;
         border-radius: 20px;
         font-size: 12px;
         font-weight: 600;
         color: #fff;
-        display: inline-block;
     }
-    .green { background: #2ecc71; }
+    .green { background: #27ae60; }
     .amber { background: #f39c12; }
     .gray  { background: #7f8c8d; }
+    .status {
+        font-size: 13px;
+        color: #555;
+        margin-bottom: 4px;
+    }
+    .summary {
+        font-size: 15px;
+        margin-bottom: 8px;
+        color: #333;
+    }
+    .section-title {
+        font-size: 13px;
+        font-weight: 700;
+        margin-top: 14px;
+        margin-bottom: 4px;
+        color: #444;
+        text-transform: uppercase;
+        letter-spacing: 0.03em;
+    }
+    ul {
+        margin-top: 4px;
+        padding-left: 20px;
+    }
+    ul li {
+        margin-bottom: 4px;
+        line-height: 1.4;
+        font-size: 14px;
+    }
     a {
         color: #3498db;
-        font-weight: 600;
         text-decoration: none;
+        font-weight: 600;
     }
     a:hover {
         text-decoration: underline;
@@ -244,29 +317,30 @@ def generate_html(jsonl_path, output_path):
 <body>
 <h1>Jira Bug Analysis Report</h1>
 
-<table>
-<thead>
-<tr>
-  <th>Ticket</th>
-  <th>Status</th>
-  <th>Category</th>
-  <th>Summary</th>
-  <th>Reasoning</th>
-  <th>Fix</th>
-  <th>Missing Details</th>
-  <th>Link</th>
-</tr>
-</thead>
-
-<tbody>
+<div class="grid">
 """
 
+    # Read all JSONL entries and build cards
     with open(jsonl_path, "r", encoding="utf-8") as f:
         for line in f:
+            if not line.strip():
+                continue
             data = json.loads(line)
-            for obj in data["results"]:
-
+            results = data.get("results", [])
+            for obj in results:
+                ticket_key = obj.get("ticket_key", "")
+                status = obj.get("status", "")
                 category = obj.get("category", "")
+                summary = obj.get("summary", "")
+
+                root_cause = obj.get("root_cause", [])
+                reasoning = obj.get("reasoning", [])
+                fix = obj.get("fix_recommendation", [])
+                risk = obj.get("risk", [])
+                missing = obj.get("missing_details", [])
+                link = obj.get("link") or (JIRA_DOMAIN + ticket_key if ticket_key else "#")
+
+                # Badge color
                 if category == "Solvable Bug":
                     badge_class = "green"
                 elif category == "Needs More Details":
@@ -275,21 +349,43 @@ def generate_html(jsonl_path, output_path):
                     badge_class = "gray"
 
                 html += f"""
-<tr class="data-row">
-  <td>{obj.get('ticket_key','')}</td>
-  <td>{obj.get('status','')}</td>
-  <td><span class="badge {badge_class}">{category}</span></td>
-  <td>{obj.get('summary','')}</td>
-  <td>{obj.get('reasoning','')}</td>
-  <td>{obj.get('fix','')}</td>
-  <td>{obj.get('missing_details','')}</td>
-  <td><a href="{obj.get('link','')}">Open</a></td>
-</tr>
+<div class="card">
+  <div class="ticket-header">
+    <a href="{link}" class="ticket-key" target="_blank" rel="noopener noreferrer">{ticket_key}</a>
+    <span class="badge {badge_class}">{category}</span>
+  </div>
+  <div class="status">Status: {status}</div>
+  <div class="summary">{summary}</div>
+
+  <div class="section-title">Root Cause</div>
+  <ul>
+    {list_to_html(root_cause)}
+  </ul>
+
+  <div class="section-title">Reasoning</div>
+  <ul>
+    {list_to_html(reasoning)}
+  </ul>
+
+  <div class="section-title">Fix Recommendation</div>
+  <ul>
+    {list_to_html(fix)}
+  </ul>
+
+  <div class="section-title">Risk</div>
+  <ul>
+    {list_to_html(risk)}
+  </ul>
+
+  <div class="section-title">Missing Details</div>
+  <ul>
+    {list_to_html(missing)}
+  </ul>
+</div>
 """
 
     html += """
-</tbody>
-</table>
+</div> <!-- grid -->
 </body>
 </html>
 """
@@ -301,48 +397,52 @@ def generate_html(jsonl_path, output_path):
 
 
 # --------------------------------------------------------
-# MAIN EXECUTION
+# MAIN
 # --------------------------------------------------------
 def main():
     if len(sys.argv) < 2:
         print("Usage: python jira_g7app_analyzer.py jira_dump.txt")
         return
 
-    path = sys.argv[1]
-    raw = read_text(path)
+    input_path = sys.argv[1]
+    raw_text = read_text(input_path)
 
-    print("🔍 Detecting tickets...")
-    tickets = extract_tickets(raw)
+    print("🔍 Extracting tickets...")
+    tickets = extract_tickets(raw_text)
     print("📦 Tickets found:", len(tickets))
 
+    if not tickets:
+        print("⚠️ No tickets detected. Check the format / regex.")
+        return
+
     chunks = chunk_tickets(tickets)
-    print("✂️ Total chunks:", len(chunks))
+    print("✂️ Chunks to process:", len(chunks))
 
     jsonl_path = "jira_results.jsonl"
-    jsonl = open(jsonl_path, "w", encoding="utf-8")
+    jsonl_file = open(jsonl_path, "w", encoding="utf-8")
 
     for idx, chunk in enumerate(chunks):
         print(f"\n🚀 Processing chunk {idx + 1}/{len(chunks)}")
-
         raw_output = call_gemini(chunk)
         parsed = extract_json(raw_output)
 
         if parsed is None:
-            print("⚠️ Skipping chunk.")
+            print("⚠️ Skipping this chunk due to JSON issues.")
             continue
 
-        jsonl.write(json.dumps({
+        jsonl_file.write(json.dumps({
             "chunk": idx,
             "results": parsed
         }) + "\n")
 
-    jsonl.close()
-    print("📁 JSONL saved:", jsonl_path)
+    jsonl_file.close()
+    print("📁 JSONL saved →", jsonl_path)
 
-    print("\n🎨 Generating HTML...")
+    print("\n🎨 Generating HTML dashboard...")
     generate_html(jsonl_path, "jira_report.html")
 
-    print("\n🔥 DONE!")
+    print("\n✅ DONE. Open 'jira_report.html' in your browser.")
+
 
 if __name__ == "__main__":
     main()
