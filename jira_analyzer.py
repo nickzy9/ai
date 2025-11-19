@@ -1,15 +1,17 @@
 import os
 import sys
 import re
-import pdfplumber
 import requests
 import json
 
+# -------------------------------------
+# CONFIGURATION
+# -------------------------------------
 API_KEY = "YOUR_GEMINI_API_KEY"
 MODEL = "gemini-2.0-pro"
 GENERATION_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={API_KEY}"
 
-MAX_TICKETS_PER_CHUNK = 5  # Adjust based on size
+MAX_TICKETS_PER_CHUNK = 5  # safe chunk size (adjust later)
 
 PROMPT_TEMPLATE = """
 You are an expert QA analyst, senior iOS engineer, and Jira triage specialist.
@@ -17,7 +19,7 @@ You are an expert QA analyst, senior iOS engineer, and Jira triage specialist.
 Process the following Jira tickets and output ONLY <tr> rows for an HTML table.
 DO NOT include <html>, <body>, or <table> tags.
 
-Extract:
+Extract for each ticket:
 - Ticket Key
 - Status
 - Category (Solvable Bug / Not a Bug / Needs More Details)
@@ -27,7 +29,7 @@ Extract:
 - Missing Details
 - Ticket Link
 
-Output per ticket:
+Output format (one <tr> per ticket):
 
 <tr>
   <td>TicketKey</td>
@@ -49,7 +51,7 @@ HTML_TEMPLATE = """
 <title>Jira Bug Analysis</title>
 <style>
 table { border-collapse: collapse; width: 100%; }
-td, th { border: 1px solid #ccc; padding: 8px; }
+td, th { border: 1px solid #ccc; padding: 8px; vertical-align: top; }
 tr:nth-child(even) { background: #f7f7f7; }
 </style>
 </head>
@@ -72,25 +74,23 @@ tr:nth-child(even) { background: #f7f7f7; }
 </html>
 """
 
+
 # ----------------------------
-# PDF → Text
+# Read text file
 # ----------------------------
-def pdf_to_text(pdf_file):
-    text = ""
-    with pdfplumber.open(pdf_file) as pdf:
-        for page in pdf.pages:
-            text += page.extract_text() + "\n\n"
-    return text
+def read_text(text_file):
+    with open(text_file, "r", encoding="utf-8") as f:
+        return f.read()
 
 
 # ----------------------------
-# Extract ticket blocks using regex
+# Extract tickets using regex
 # ----------------------------
 def extract_tickets(text):
-    # Regex finds ticket keys like "ABC-123"
+    # Jira ticket keys: ABC-123, DEF-9999, etc.
     pattern = r"([A-Z]{2,10}-\d+)"
-    matches = list(re.finditer(pattern, text))
 
+    matches = list(re.finditer(pattern, text))
     tickets = []
 
     for i in range(len(matches)):
@@ -115,37 +115,33 @@ def chunk_tickets(tickets):
 
 
 # ----------------------------
-# Call Gemini REST API
+# Call Gemini API
 # ----------------------------
 def call_gemini(chunk):
     payload = {
-        "contents": [{
-            "parts": [{
-                "text": PROMPT_TEMPLATE + "\n" + chunk
-            }]
-        }]
+        "contents": [
+            {"parts": [{"text": PROMPT_TEMPLATE + "\n" + chunk}]}
+        ]
     }
 
-    resp = requests.post(
+    response = requests.post(
         GENERATION_URL,
         headers={"Content-Type": "application/json"},
-        data=json.dumps(payload)
+        data=json.dumps(payload),
     )
 
-    if resp.status_code != 200:
-        print("❌ API error:", resp.text)
+    if response.status_code != 200:
+        print("❌ API Error:", response.text)
         return ""
 
-    data = resp.json()
-
     try:
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+        return response.json()["candidates"][0]["content"]["parts"][0]["text"]
     except:
         return ""
 
 
 # ----------------------------
-# Extract <tr> rows
+# Extract <tr> rows from output
 # ----------------------------
 def extract_rows(text):
     rows = []
@@ -156,23 +152,23 @@ def extract_rows(text):
 
 
 # ----------------------------
-# Main Function
+# Main
 # ----------------------------
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python jira_pdf_analyzer.py file.pdf")
+        print("Usage: python jira_text_analyzer.py jira_dump.txt")
         return
 
-    pdf_file = sys.argv[1]
+    text_file = sys.argv[1]
 
-    print("📄 Extracting text from PDF...")
-    raw_text = pdf_to_text(pdf_file)
+    print("📄 Reading text file...")
+    raw_text = read_text(text_file)
 
     print("🔍 Detecting tickets...")
     tickets = extract_tickets(raw_text)
     print(f"📦 Total tickets found: {len(tickets)}")
 
-    print("✂️ Splitting into chunks...")
+    print("✂️ Creating chunks...")
     chunks = chunk_tickets(tickets)
     print(f"📦 Total chunks: {len(chunks)}")
 
@@ -186,10 +182,10 @@ def main():
         all_rows.extend(rows)
 
     print("\n🧩 Building final HTML...")
-    html = HTML_TEMPLATE.format(rows="\n".join(all_rows))
+    final_html = HTML_TEMPLATE.format(rows="\n".join(all_rows))
 
     with open("jira_report.html", "w", encoding="utf-8") as f:
-        f.write(html)
+        f.write(final_html)
 
     print("✅ Done! Saved as jira_report.html")
 
